@@ -1,4 +1,4 @@
-use text_fragments::*;
+use htmloc::*;
 
 /**
 For `1 Corinthians 12:27`: `members%20of%20it.-,1%20Corinthians%2012%3A27,-(ESV)`
