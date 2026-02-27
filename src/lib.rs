@@ -1,6 +1,5 @@
 use line_col::LineColLookup;
 use regex::Regex;
-use std::borrow::Cow;
 use urlencoding::{decode, encode};
 
 const MAX_EXACT_MATCH_LENGTH: usize = 300;
@@ -12,10 +11,22 @@ pub struct Position {
     pub column: usize, // 1-indexed
 }
 
+impl Position {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub start: Position,
     pub end: Position,
+}
+
+impl Selection {
+    pub fn new(start: Position, end: Position) -> Self {
+        Self { start, end }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,9 +81,6 @@ impl TextFragment {
         }
 
         let mut prefix = None;
-        let mut suffix = None;
-        let mut text_start = String::new();
-        let mut text_end = None;
 
         let mut idx = 0;
 
@@ -88,10 +96,13 @@ impl TextFragment {
         }
 
         // 2. Parse text_start
-        text_start = decode(parts[idx]).ok()?.into_owned();
+        let text_start = decode(parts[idx]).ok()?.into_owned();
         idx += 1;
 
         // 3. Check for text_end and suffix
+        let mut suffix = None;
+        let mut text_end = None;
+
         if idx < parts.len() {
             if parts[idx].starts_with('-') {
                 let s = &parts[idx][1..];
@@ -116,15 +127,32 @@ impl TextFragment {
     }
 }
 
+pub enum SourceType<'a> {
+    PlainText(&'a str),
+    HTML(&'a str),
+}
+
 pub struct Document<'a> {
-    pub source: &'a str,
-    pub plain_text: String,
+    source: &'a str,
+    plain_text: String,
     lookup: LineColLookup<'a>,
     source_to_plain_map: Option<Vec<usize>>,
     plain_to_source_map: Option<Vec<usize>>,
 }
 
 impl<'a> Document<'a> {
+    pub fn source(&'a self) -> SourceType<'a> {
+        if self.plain_text.len() == self.source.len() {
+            SourceType::PlainText(&self.plain_text)
+        } else {
+            SourceType::HTML(self.source)
+        }
+    }
+
+    pub fn plain_text(&'a self) -> &'a str {
+        &self.plain_text
+    }
+
     pub fn from_plain_text(text: &'a str) -> Self {
         Self {
             source: text,
@@ -255,6 +283,26 @@ impl<'a> FragmentEngine<'a> {
         Self { doc }
     }
 
+    pub fn from_html(html: &'a str) -> Self {
+        Self::new(Document::from_html(html))
+    }
+
+    pub fn from_plain_text(text: &'a str) -> Self {
+        Self::new(Document::from_plain_text(text))
+    }
+
+    pub fn plain_text(&'a self) -> &'a str {
+        self.doc.plain_text()
+    }
+
+    pub fn source(&'a self) -> SourceType<'a> {
+        self.doc.source()
+    }
+
+    pub fn doc(&'a self) -> &'a Document<'a> {
+        &self.doc
+    }
+
     /// Generates a fragment, with an optional robustness configuration to enforce prefix/suffix inclusion.
     pub fn generate(
         &self,
@@ -326,7 +374,8 @@ impl<'a> FragmentEngine<'a> {
         start_byte: usize,
         end_byte: usize,
         text_start: &str,
-        text_end: Option<&str>,
+        // TODO: Why is this not used?
+        _text_end: Option<&str>,
         opts: &GenerateOptions,
     ) -> (Option<String>, Option<String>) {
         let before_text = &self.doc.plain_text[..start_byte];
@@ -363,7 +412,7 @@ impl<'a> FragmentEngine<'a> {
             }
 
             let p = prefix_words.join(" ");
-            let s = suffix_words.join(" ");
+            let _s = suffix_words.join(" ");
 
             // Check uniqueness if we aren't already unique
             if !is_unique {

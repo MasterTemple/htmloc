@@ -157,8 +157,6 @@ fn test3() {
 
 #[test]
 fn reverse() {
-    let url = "https://svrbc.org/articles/2020-12-21/is-church-membership-biblical";
-    let f = |tf: &TextFragment| format!("{url}{}", tf.to_hash_string());
     let html = include_str!("./html/Is Church Membership Biblical? - by SVRBC.html");
     let doc = Document::from_html(html);
     let doc = FragmentEngine::new(doc);
