@@ -154,3 +154,22 @@ fn test3() {
     // it includes
     assert_eq!(doc.resolve_fragment(&tf).unwrap(), range);
 }
+
+#[test]
+fn reverse() {
+    let url = "https://svrbc.org/articles/2020-12-21/is-church-membership-biblical";
+    let f = |tf: &TextFragment| format!("{url}{}", tf.to_hash_string());
+    let html = include_str!("./html/Is Church Membership Biblical? - by SVRBC.html");
+    let doc = Document::from_html(html);
+    let doc = FragmentEngine::new(doc);
+    // https://svrbc.org/articles/2020-12-21/is-church-membership-biblical/#:~:text=He%20cannot%20pastor%20every%20Christian%20on%20the%20planet%20since%20he%20does%20not%20have%20the%20capacity%20to.
+    let hash = "#:~:text=He%20cannot%20pastor%20every%20Christian%20on%20the%20planet%20since%20he%20does%20not%20have%20the%20capacity%20to.";
+    let tf = TextFragment::from_hash_string(hash).unwrap();
+    let range = doc.resolve_fragment(&tf).unwrap();
+    let tf2 = doc.generate(range, None).unwrap();
+    // I don't expect hashes to be the same (my algorithm is different and I don't know what the
+    // original is)
+    // But the range round trip should be good
+    let range2 = doc.resolve_fragment(&tf2).unwrap();
+    assert_eq!(range, range2);
+}
