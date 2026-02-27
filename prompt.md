@@ -20,3 +20,11 @@ Very good
 
 - For the sake of robustness, allow the user to pass an optional robustness parameter that will not be satisfied at being unique, but will include a prefix and suffix (even though not necessary). Let the user be able to adjust how much of the prefix and suffix they want.
 - Also allow the reverse process: take a text fragment and create the line-column range
+
+---
+
+Yes, add the following features:
+
+- Parse a text fragment from the hash
+- Make the fragment resolver handle complex whitespace (use RegEx or Chumsky or a handcrafted solution)
+- When resolving the end index, make sure that you give the ending index of the text (not including the following HTML tags). Previously, `1 Peter 5:2 (ESV)` in `<p><span class=citation>1 Peter 5:2 (ESV)</span></p>` would calculate the end index at `>` in `</span></p>` instead of `)` in `(ESV)` (which is part of the matched text)

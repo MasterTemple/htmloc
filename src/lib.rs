@@ -1,4 +1,5 @@
 use line_col::LineColLookup;
+use regex::Regex;
 use std::borrow::Cow;
 use urlencoding::{decode, encode};
 
@@ -19,9 +20,7 @@ pub struct Selection {
 
 #[derive(Debug, Clone, Default)]
 pub struct GenerateOptions {
-    /// Forces the generator to include at least this many prefix words, even if already unique.
     pub min_prefix_words: usize,
-    /// Forces the generator to include at least this many suffix words, even if already unique.
     pub min_suffix_words: usize,
 }
 
@@ -58,6 +57,63 @@ impl TextFragment {
         }
         format!("#:~:text={}", parts.join(","))
     }
+
+    /// Parses a Text Fragment from a URL hash string (e.g., "#:~:text=prefix-,start,end,-suffix")
+    pub fn from_hash_string(hash: &str) -> Option<Self> {
+        // Extract the payload after "#:~:text=" or "~:text="
+        let payload = hash.split("~:text=").last().unwrap_or(hash);
+        let payload = payload.split('&').next().unwrap_or(payload); // Ignore other hash params
+
+        let parts: Vec<&str> = payload.split(',').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut prefix = None;
+        let mut suffix = None;
+        let mut text_start = String::new();
+        let mut text_end = None;
+
+        let mut idx = 0;
+
+        // 1. Check for prefix (ends with '-')
+        if parts[idx].ends_with('-') {
+            let p = &parts[idx][..parts[idx].len() - 1];
+            prefix = Some(decode(p).ok()?.into_owned());
+            idx += 1;
+        }
+
+        if idx >= parts.len() {
+            return None;
+        }
+
+        // 2. Parse text_start
+        text_start = decode(parts[idx]).ok()?.into_owned();
+        idx += 1;
+
+        // 3. Check for text_end and suffix
+        if idx < parts.len() {
+            if parts[idx].starts_with('-') {
+                let s = &parts[idx][1..];
+                suffix = Some(decode(s).ok()?.into_owned());
+            } else {
+                text_end = Some(decode(parts[idx]).ok()?.into_owned());
+                idx += 1;
+                // If there's still a part left, it must be the suffix
+                if idx < parts.len() && parts[idx].starts_with('-') {
+                    let s = &parts[idx][1..];
+                    suffix = Some(decode(s).ok()?.into_owned());
+                }
+            }
+        }
+
+        Some(TextFragment {
+            prefix,
+            text_start,
+            text_end,
+            suffix,
+        })
+    }
 }
 
 pub struct Document<'a> {
@@ -93,7 +149,6 @@ impl<'a> Document<'a> {
     fn strip_html_and_map(html: &str) -> (String, Vec<usize>, Vec<usize>) {
         let mut in_tag = false;
         let mut plain_text = String::with_capacity(html.len());
-
         let mut source_to_plain_map = vec![0; html.len() + 1];
         let mut plain_to_source_map = Vec::with_capacity(html.len());
 
@@ -152,8 +207,8 @@ impl<'a> Document<'a> {
         }
     }
 
-    /// Converts a plain text byte offset back into a line-column pair in the original source
-    pub fn resolve_to_source_position(&self, plain_text_byte: usize) -> Option<Position> {
+    /// Converts a plain text start byte offset back into a line-column pair
+    pub fn resolve_start_to_source_position(&self, plain_text_byte: usize) -> Option<Position> {
         let source_byte = if let Some(map) = &self.plain_to_source_map {
             *map.get(plain_text_byte)?
         } else {
@@ -161,6 +216,32 @@ impl<'a> Document<'a> {
         };
 
         let (line, col) = self.lookup.get(source_byte);
+        Some(Position { line, column: col })
+    }
+
+    /// Converts a plain text end byte offset back into a line-column pair,
+    /// explicitly excluding trailing HTML tags from the boundary.
+    pub fn resolve_end_to_source_position(&self, plain_text_end_byte: usize) -> Option<Position> {
+        if plain_text_end_byte == 0 {
+            let (line, col) = self.lookup.get(0);
+            return Some(Position { line, column: col });
+        }
+
+        // Get the last character of the matched plain text
+        let last_char = self.plain_text[..plain_text_end_byte].chars().last()?;
+        let last_char_plain_idx = plain_text_end_byte - last_char.len_utf8();
+
+        let source_byte_start = if let Some(map) = &self.plain_to_source_map {
+            *map.get(last_char_plain_idx)?
+        } else {
+            last_char_plain_idx
+        };
+
+        // Add the UTF-8 length to place the end boundary exactly after the character,
+        // strictly before any subsequent HTML tags (like </span> or </div>)
+        let source_byte_end = source_byte_start + last_char.len_utf8();
+        let (line, col) = self.lookup.get(source_byte_end);
+
         Some(Position { line, column: col })
     }
 }
@@ -211,81 +292,6 @@ impl<'a> FragmentEngine<'a> {
             text_start,
             text_end,
             suffix,
-        })
-    }
-
-    /// Resolves a Text Fragment back into a Line-Column Selection in the original source.
-    pub fn resolve_fragment(&self, fragment: &TextFragment) -> Option<Selection> {
-        // Simplified matching: In a strict Chromium port, this would handle complex whitespace folding.
-        // Here, we find matches of `text_start` and expand to `text_end` if present.
-
-        let mut match_start_byte = None;
-        let mut match_end_byte = None;
-
-        let search_text = &self.doc.plain_text;
-
-        // Find all occurrences of text_start
-        let start_indices = search_text
-            .match_indices(&fragment.text_start)
-            .map(|(i, _)| i);
-
-        for start_idx in start_indices {
-            dbg!(start_idx);
-            let mut is_valid = true;
-
-            // 1. Verify Prefix
-            if let Some(prefix) = &fragment.prefix {
-                let before_text = &search_text[..start_idx];
-                dbg!(before_text);
-                if !before_text.trim_end().ends_with(prefix) {
-                    is_valid = false;
-                }
-            }
-
-            if !is_valid {
-                continue;
-            }
-
-            // 2. Find text_end (or just use text_start's end)
-            let mut end_idx = start_idx + fragment.text_start.len();
-
-            if let Some(text_end) = &fragment.text_end {
-                let after_start_text = &search_text[end_idx..];
-                dbg!(after_start_text);
-                if let Some(end_offset) = after_start_text.find(text_end) {
-                    end_idx += end_offset + text_end.len();
-                } else {
-                    is_valid = false;
-                }
-            }
-
-            if !is_valid {
-                continue;
-            }
-
-            // 3. Verify Suffix
-            if let Some(suffix) = &fragment.suffix {
-                let after_text = &search_text[end_idx..];
-                dbg!(after_text);
-                if !after_text.trim_start().starts_with(suffix) {
-                    is_valid = false;
-                }
-            }
-
-            if is_valid {
-                match_start_byte = Some(start_idx);
-                match_end_byte = Some(end_idx);
-                break; // Found the unique match
-            }
-        }
-
-        let start_pos = self.doc.resolve_to_source_position(match_start_byte?)?;
-        let end_pos = self.doc.resolve_to_source_position(match_end_byte?)?;
-        // .resolve_to_source_position(match_end_byte.map(|b| b - 1)?)?;
-
-        Some(Selection {
-            start: start_pos,
-            end: end_pos,
         })
     }
 
@@ -382,5 +388,55 @@ impl<'a> FragmentEngine<'a> {
                 Some(suffix_words.join(" "))
             },
         )
+    }
+
+    /// Converts text into a regex pattern that matches any sequence of whitespace (handling newlines/tabs).
+    fn build_ws_regex(text: &str) -> String {
+        text.split_whitespace()
+            .map(|w| regex::escape(w))
+            .collect::<Vec<_>>()
+            .join(r"\s+")
+    }
+
+    /// Resolves a Text Fragment back into a Line-Column Selection using robust regex whitespace folding.
+    pub fn resolve_fragment(&self, fragment: &TextFragment) -> Option<Selection> {
+        let mut pattern = String::new();
+
+        // 1. Prefix group (optional match, but ensures context if present)
+        if let Some(p) = &fragment.prefix {
+            pattern.push_str(&format!("(?P<prefix>{}\\s+)", Self::build_ws_regex(p)));
+        }
+
+        // 2. Core group (This captures the actual bounds of the returned text)
+        let start_rx = Self::build_ws_regex(&fragment.text_start);
+        if let Some(e) = &fragment.text_end {
+            let end_rx = Self::build_ws_regex(e);
+            // (?s:.*?) allows matching across newlines non-greedily between start and end
+            pattern.push_str(&format!("(?P<core>{}(?s:.*?){})", start_rx, end_rx));
+        } else {
+            pattern.push_str(&format!("(?P<core>{})", start_rx));
+        }
+
+        // 3. Suffix group
+        if let Some(s) = &fragment.suffix {
+            pattern.push_str(&format!("(?P<suffix>\\s+{})", Self::build_ws_regex(s)));
+        }
+
+        // Compile and find the first match
+        let re = Regex::new(&pattern).ok()?;
+        let captures = re.captures(&self.doc.plain_text)?;
+
+        // Extract the exact bounds of the 'core' match (excluding prefix/suffix spaces)
+        let core_match = captures.name("core")?;
+
+        let start_pos = self
+            .doc
+            .resolve_start_to_source_position(core_match.start())?;
+        let end_pos = self.doc.resolve_end_to_source_position(core_match.end())?;
+
+        Some(Selection {
+            start: start_pos,
+            end: end_pos,
+        })
     }
 }

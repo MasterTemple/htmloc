@@ -37,7 +37,7 @@ fn test1() {
         .unwrap();
     dbg!(&tf);
     println!("{}", f(&tf));
-    // assert_eq!(doc.resolve_fragment(&tf).unwrap(), range);
+    assert_eq!(doc.resolve_fragment(&tf).unwrap(), range);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn test2() {
         .unwrap();
     dbg!(&tf);
     println!("{}", f(&tf));
-    // assert_eq!(doc.resolve_fragment(&tf).unwrap(), range);
+    assert_eq!(doc.resolve_fragment(&tf).unwrap(), range);
 }
 
 #[test]
