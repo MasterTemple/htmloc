@@ -9,4 +9,14 @@ Create a rust library for creating text fragments from line-column pairs
 
 You may support any additional, relevant features:
 - Calculating text fragments from plain-text documents (not just HTML)
-- Query 
+
+---
+
+Yes, add the capability to optionally run on raw HTML. You may also use the line_col crate if that is faster (for resolving byte offsets)
+
+---
+
+Very good
+
+- For the sake of robustness, allow the user to pass an optional robustness parameter that will not be satisfied at being unique, but will include a prefix and suffix (even though not necessary). Let the user be able to adjust how much of the prefix and suffix they want.
+- Also allow the reverse process: take a text fragment and create the line-column range

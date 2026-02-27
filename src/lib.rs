@@ -1,13 +1,13 @@
 use line_col::LineColLookup;
 use std::borrow::Cow;
-use urlencoding::encode;
+use urlencoding::{decode, encode};
 
 const MAX_EXACT_MATCH_LENGTH: usize = 300;
 const MIN_CONTEXT_WORDS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
-    pub line: usize,   // 1-indexed (Standard for line-col crate)
+    pub line: usize,   // 1-indexed
     pub column: usize, // 1-indexed
 }
 
@@ -17,7 +17,24 @@ pub struct Selection {
     pub end: Position,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+pub struct GenerateOptions {
+    /// Forces the generator to include at least this many prefix words, even if already unique.
+    pub min_prefix_words: usize,
+    /// Forces the generator to include at least this many suffix words, even if already unique.
+    pub min_suffix_words: usize,
+}
+
+impl GenerateOptions {
+    pub fn new(min_prefix_words: usize, min_suffix_words: usize) -> Self {
+        Self {
+            min_prefix_words,
+            min_suffix_words,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextFragment {
     pub prefix: Option<String>,
     pub text_start: String,
@@ -26,6 +43,7 @@ pub struct TextFragment {
 }
 
 impl TextFragment {
+    /// Serializes the fragment into the standard URL hash format
     pub fn to_hash_string(&self) -> String {
         let mut parts = Vec::new();
         if let Some(prefix) = &self.prefix {
@@ -42,13 +60,12 @@ impl TextFragment {
     }
 }
 
-/// A parsed document representation supporting both Plain Text and HTML mapping
 pub struct Document<'a> {
     pub source: &'a str,
     pub plain_text: String,
     lookup: LineColLookup<'a>,
-    /// Maps HTML source byte index -> Plain Text byte index
     source_to_plain_map: Option<Vec<usize>>,
+    plain_to_source_map: Option<Vec<usize>>,
 }
 
 impl<'a> Document<'a> {
@@ -58,32 +75,33 @@ impl<'a> Document<'a> {
             plain_text: text.to_string(),
             lookup: LineColLookup::new(text),
             source_to_plain_map: None,
+            plain_to_source_map: None,
         }
     }
 
     pub fn from_html(html: &'a str) -> Self {
-        let (plain_text, map) = Self::strip_html_and_map(html);
+        let (plain_text, s2p, p2s) = Self::strip_html_and_map(html);
         Self {
             source: html,
             plain_text,
             lookup: LineColLookup::new(html),
-            source_to_plain_map: Some(map),
+            source_to_plain_map: Some(s2p),
+            plain_to_source_map: Some(p2s),
         }
     }
 
-    /// Strips HTML tags and creates a map of Source Byte Index -> Plain Text Byte Index.
-    /// *Note: For production, consider using a full DOM parser to ignore `<script>` and `display: none` nodes.*
-    fn strip_html_and_map(html: &str) -> (String, Vec<usize>) {
+    fn strip_html_and_map(html: &str) -> (String, Vec<usize>, Vec<usize>) {
         let mut in_tag = false;
         let mut plain_text = String::with_capacity(html.len());
+
         let mut source_to_plain_map = vec![0; html.len() + 1];
+        let mut plain_to_source_map = Vec::with_capacity(html.len());
 
         for (i, c) in html.char_indices() {
             if c == '<' {
                 in_tag = true;
             }
 
-            // Map the current HTML byte offset to the current plain_text byte offset
             for byte_offset in 0..c.len_utf8() {
                 if i + byte_offset < source_to_plain_map.len() {
                     source_to_plain_map[i + byte_offset] = plain_text.len();
@@ -91,6 +109,9 @@ impl<'a> Document<'a> {
             }
 
             if !in_tag {
+                for byte_offset in 0..c.len_utf8() {
+                    plain_to_source_map.push(i + byte_offset);
+                }
                 plain_text.push(c);
             }
 
@@ -99,18 +120,11 @@ impl<'a> Document<'a> {
             }
         }
 
-        // Ensure the EOF boundary is mapped
         source_to_plain_map[html.len()] = plain_text.len();
-
-        (plain_text, source_to_plain_map)
+        (plain_text, source_to_plain_map, plain_to_source_map)
     }
 
-    /// Converts a 1-indexed line/col into a byte offset using the `line_col` crate lookup.
-    /// Then maps it to the plain text buffer if this is an HTML document.
     pub fn resolve_to_plain_text_offset(&self, pos: &Position) -> Option<usize> {
-        // Find the source byte offset manually (line_col is usually byte -> line/col,
-        // but we can reverse it by maintaining a line_starts index or iterating slightly).
-        // For simplicity, we calculate the byte offset of the line start.
         let mut current_line = 1;
         let mut line_start_byte = 0;
 
@@ -124,7 +138,6 @@ impl<'a> Document<'a> {
             }
         }
 
-        // Add the column offset (assuming pos.column is character-based)
         let source_byte = line_start_byte
             + self.source[line_start_byte..]
                 .chars()
@@ -138,18 +151,37 @@ impl<'a> Document<'a> {
             Some(source_byte)
         }
     }
+
+    /// Converts a plain text byte offset back into a line-column pair in the original source
+    pub fn resolve_to_source_position(&self, plain_text_byte: usize) -> Option<Position> {
+        let source_byte = if let Some(map) = &self.plain_to_source_map {
+            *map.get(plain_text_byte)?
+        } else {
+            plain_text_byte
+        };
+
+        let (line, col) = self.lookup.get(source_byte);
+        Some(Position { line, column: col })
+    }
 }
 
-pub struct FragmentGenerator<'a> {
+pub struct FragmentEngine<'a> {
     doc: Document<'a>,
 }
 
-impl<'a> FragmentGenerator<'a> {
+impl<'a> FragmentEngine<'a> {
     pub fn new(doc: Document<'a>) -> Self {
         Self { doc }
     }
 
-    pub fn generate(&self, selection: Selection) -> Option<TextFragment> {
+    /// Generates a fragment, with an optional robustness configuration to enforce prefix/suffix inclusion.
+    pub fn generate(
+        &self,
+        selection: Selection,
+        options: Option<GenerateOptions>,
+    ) -> Option<TextFragment> {
+        let opts = options.unwrap_or_default();
+
         let start_byte = self.doc.resolve_to_plain_text_offset(&selection.start)?;
         let end_byte = self.doc.resolve_to_plain_text_offset(&selection.end)?;
 
@@ -159,29 +191,101 @@ impl<'a> FragmentGenerator<'a> {
 
         let selected_text = &self.doc.plain_text[start_byte..end_byte];
         let cleaned_text = self.clean_text(selected_text);
-
         if cleaned_text.is_empty() {
             return None;
         }
 
         let (text_start, text_end) = self.determine_start_end(&cleaned_text);
-        let is_unique = self.is_unique(&text_start, text_end.as_deref());
 
-        let mut prefix = None;
-        let mut suffix = None;
-
-        if !is_unique {
-            let (p, s) =
-                self.calculate_context(start_byte, end_byte, &text_start, text_end.as_deref());
-            prefix = p;
-            suffix = s;
-        }
+        // Context calculation handles both uniqueness AND the robustness minimums
+        let (prefix, suffix) = self.calculate_context(
+            start_byte,
+            end_byte,
+            &text_start,
+            text_end.as_deref(),
+            &opts,
+        );
 
         Some(TextFragment {
             prefix,
             text_start,
             text_end,
             suffix,
+        })
+    }
+
+    /// Resolves a Text Fragment back into a Line-Column Selection in the original source.
+    pub fn resolve_fragment(&self, fragment: &TextFragment) -> Option<Selection> {
+        // Simplified matching: In a strict Chromium port, this would handle complex whitespace folding.
+        // Here, we find matches of `text_start` and expand to `text_end` if present.
+
+        let mut match_start_byte = None;
+        let mut match_end_byte = None;
+
+        let search_text = &self.doc.plain_text;
+
+        // Find all occurrences of text_start
+        let start_indices = search_text
+            .match_indices(&fragment.text_start)
+            .map(|(i, _)| i);
+
+        for start_idx in start_indices {
+            dbg!(start_idx);
+            let mut is_valid = true;
+
+            // 1. Verify Prefix
+            if let Some(prefix) = &fragment.prefix {
+                let before_text = &search_text[..start_idx];
+                dbg!(before_text);
+                if !before_text.trim_end().ends_with(prefix) {
+                    is_valid = false;
+                }
+            }
+
+            if !is_valid {
+                continue;
+            }
+
+            // 2. Find text_end (or just use text_start's end)
+            let mut end_idx = start_idx + fragment.text_start.len();
+
+            if let Some(text_end) = &fragment.text_end {
+                let after_start_text = &search_text[end_idx..];
+                dbg!(after_start_text);
+                if let Some(end_offset) = after_start_text.find(text_end) {
+                    end_idx += end_offset + text_end.len();
+                } else {
+                    is_valid = false;
+                }
+            }
+
+            if !is_valid {
+                continue;
+            }
+
+            // 3. Verify Suffix
+            if let Some(suffix) = &fragment.suffix {
+                let after_text = &search_text[end_idx..];
+                dbg!(after_text);
+                if !after_text.trim_start().starts_with(suffix) {
+                    is_valid = false;
+                }
+            }
+
+            if is_valid {
+                match_start_byte = Some(start_idx);
+                match_end_byte = Some(end_idx);
+                break; // Found the unique match
+            }
+        }
+
+        let start_pos = self.doc.resolve_to_source_position(match_start_byte?)?;
+        let end_pos = self.doc.resolve_to_source_position(match_end_byte?)?;
+        // .resolve_to_source_position(match_end_byte.map(|b| b - 1)?)?;
+
+        Some(Selection {
+            start: start_pos,
+            end: end_pos,
         })
     }
 
@@ -211,26 +315,13 @@ impl<'a> FragmentGenerator<'a> {
         (start_words, Some(end_words))
     }
 
-    fn is_unique(&self, start: &str, end: Option<&str>) -> bool {
-        let cleaned_doc = self.clean_text(&self.doc.plain_text);
-        if let Some(end_text) = end {
-            if let Some(idx) = cleaned_doc.find(start) {
-                if cleaned_doc[idx + start.len()..].find(end_text).is_some() {
-                    return cleaned_doc[idx + 1..].find(start).is_none();
-                }
-            }
-            false
-        } else {
-            cleaned_doc.matches(start).count() == 1
-        }
-    }
-
     fn calculate_context(
         &self,
         start_byte: usize,
         end_byte: usize,
         text_start: &str,
         text_end: Option<&str>,
+        opts: &GenerateOptions,
     ) -> (Option<String>, Option<String>) {
         let before_text = &self.doc.plain_text[..start_byte];
         let after_text = &self.doc.plain_text[end_byte..];
@@ -242,25 +333,41 @@ impl<'a> FragmentGenerator<'a> {
         let mut suffix_words = Vec::new();
         let mut is_unique = false;
 
-        while !is_unique && (!before_words.is_empty() || !after_words.is_empty()) {
+        // Loop until unique AND robustness minimums are met
+        while (!is_unique
+            || prefix_words.len() < opts.min_prefix_words
+            || suffix_words.len() < opts.min_suffix_words)
+            && (!before_words.is_empty() || !after_words.is_empty())
+        {
             if let Some(w) = before_words.first() {
-                prefix_words.insert(0, *w);
-                before_words.remove(0);
+                if prefix_words.len() < opts.min_prefix_words
+                    || (!is_unique && prefix_words.len() <= suffix_words.len())
+                {
+                    prefix_words.insert(0, *w);
+                    before_words.remove(0);
+                }
             }
             if let Some(w) = after_words.first() {
-                suffix_words.push(*w);
-                after_words.remove(0);
+                if suffix_words.len() < opts.min_suffix_words
+                    || (!is_unique && suffix_words.len() < prefix_words.len())
+                {
+                    suffix_words.push(*w);
+                    after_words.remove(0);
+                }
             }
 
             let p = prefix_words.join(" ");
             let s = suffix_words.join(" ");
 
-            let pattern = format!("{} {}", p, text_start).trim().to_string();
-            is_unique = self
-                .clean_text(&self.doc.plain_text)
-                .matches(&pattern)
-                .count()
-                == 1;
+            // Check uniqueness if we aren't already unique
+            if !is_unique {
+                let pattern = format!("{} {}", p, text_start).trim().to_string();
+                is_unique = self
+                    .clean_text(&self.doc.plain_text)
+                    .matches(&pattern)
+                    .count()
+                    == 1;
+            }
         }
 
         (
