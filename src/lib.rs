@@ -5,6 +5,23 @@ use urlencoding::{decode, encode};
 const MAX_EXACT_MATCH_LENGTH: usize = 300;
 const MIN_CONTEXT_WORDS: usize = 3;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ByteIndex {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl<'h> From<regex::Match<'h>> for ByteIndex {
+    fn from(value: regex::Match<'h>) -> Self {
+        ByteIndex::new(value.start(), value.end())
+    }
+}
+impl ByteIndex {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     pub line: usize,   // 1-indexed
@@ -21,6 +38,7 @@ impl Position {
 pub struct Selection {
     pub start: Position,
     pub end: Position,
+    pub bytes: ByteIndex,
 }
 
 impl Selection {
@@ -483,9 +501,12 @@ impl<'a> FragmentEngine<'a> {
             .resolve_start_to_source_position(core_match.start())?;
         let end_pos = self.doc.resolve_end_to_source_position(core_match.end())?;
 
+        let bytes = ByteIndex::from(core_match);
+
         Some(Selection {
             start: start_pos,
             end: end_pos,
+            bytes,
         })
     }
 }

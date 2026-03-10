@@ -2,6 +2,7 @@
 name = "htmloc"
 version = "0.1.0"
 edition = "2024"
+description = "This is a bi-directional line-column to Text Fragment converter."
 
 [dependencies]
 line-col = "0.2.1"
