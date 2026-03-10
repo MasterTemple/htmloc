@@ -42,8 +42,8 @@ pub struct Selection {
 }
 
 impl Selection {
-    pub fn new(start: Position, end: Position) -> Self {
-        Self { start, end }
+    pub fn new(start: Position, end: Position, bytes: ByteIndex) -> Self {
+        Self { start, end, bytes }
     }
 }
 
